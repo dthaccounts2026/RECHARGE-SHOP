@@ -2941,13 +2941,16 @@ function doClearHistory() {
 function clearAllData() {
   // Reset modal to step 1 fresh state
   flashGoStep1();
-  // Default: data checked, others unchecked
+  // Default: data + cloud both checked together. Wiping local data while
+  // leaving cloud data intact (or vice versa) is what causes other devices
+  // to either miss the reset or "resurrect" the deleted data on refresh —
+  // so by default these two now move together.
   const d = document.getElementById('opt-data');
   const a = document.getElementById('opt-account');
   const c = document.getElementById('opt-cloud');
   if (d) d.checked = true;
   if (a) a.checked = false;
-  if (c) c.checked = false;
+  if (c) c.checked = true;
   updateFlashBtn();
   openModal("modal-clear-all");
 }
@@ -3048,12 +3051,28 @@ async function doFullFlash() {
       showToast('☁️ Wiping cloud data...', '');
       try {
         const cfg = _getSupabaseConfig ? _getSupabaseConfig() : { url: SUPABASE_URL, key: SUPABASE_KEY };
-        // Delete all rows from main table
-        await fetch(cfg.url + '/rest/v1/' + RS_TABLE + '?key=neq.null', {
-          method: 'DELETE',
-          headers: { 'apikey': cfg.key, 'Authorization': 'Bearer ' + cfg.key }
+        // IMPORTANT: UPSERT empty values instead of DELETE-ing rows.
+        // A DELETE fires a Realtime DELETE event where payload.new is empty,
+        // which other connected devices' listener has no way to act on —
+        // they silently ignore it and keep showing stale local data.
+        // UPSERT-ing to '[]' fires a normal UPDATE event with a real
+        // payload.new.key/value, which every connected device already
+        // knows how to apply instantly via _applyRow(), clearing their
+        // screens live instead of only on next manual refresh.
+        await fetch(cfg.url + '/rest/v1/' + RS_TABLE, {
+          method: 'POST',
+          headers: {
+            'apikey': cfg.key, 'Authorization': 'Bearer ' + cfg.key,
+            'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates'
+          },
+          body: JSON.stringify([
+            { key: 'rs_wallets', value: '[]' },
+            { key: 'rs_txns',    value: '[]' },
+            { key: 'rs_history', value: '[]' }
+          ])
         });
-        // Delete all rows from records table
+        // Delete all rows from the per-record table (used for delta sync;
+        // safe to fully delete since no UI reads it directly for "live" state)
         await fetch(cfg.url + '/rest/v1/recharge_records?id=neq.null', {
           method: 'DELETE',
           headers: { 'apikey': cfg.key, 'Authorization': 'Bearer ' + cfg.key }
@@ -3077,6 +3096,11 @@ async function doFullFlash() {
     _lastRenderKey = '';
     render();
     showToast('✅ ' + msgs.join(' + ') + ' wiped successfully', 'ok');
+    // Re-enable sync and reconnect realtime — the channel was torn down
+    // at the start of this function and must be restarted, otherwise this
+    // device silently stops receiving/sending live updates until reloaded.
+    window._syncBlocked = false;
+    startRealtimeSync();
   }
 }
 
@@ -3578,10 +3602,12 @@ async function autoRestoreFromSupabase() {
           applyBizName();
           render();
         }
-      } else if (!data || data.length === 0) {
-        // Cloud empty — push local data up
-        _sbBulkSave();
       }
+      // NOTE: previously, an empty cloud would trigger pushing local data
+      // back up automatically. That resurrected data after an intentional
+      // Reset on another device (cloud is empty on purpose). Removed —
+      // pushing now only happens through normal save flows (add/edit/etc),
+      // never as a side-effect of merely loading the page.
       return;
     }
     // Not logged in — pull from Supabase to pre-fill local
@@ -4016,6 +4042,16 @@ function startRealtimeSync() {
       .on('postgres_changes', { event: '*', schema: 'public', table: RS_TABLE }, function(payload) {
         try {
           if (window._syncBlocked) return;
+          // Handle deletes too — payload.new is empty on DELETE, the row
+          // info lives in payload.old. Without this, a deleted row is
+          // silently ignored and this device keeps showing stale data.
+          if (payload.eventType === 'DELETE') {
+            const oldRow = payload.old;
+            if (oldRow && oldRow.key && _syncKeys.includes(oldRow.key)) {
+              _applyRow(oldRow.key, ['rs_wallets','rs_txns','rs_history'].includes(oldRow.key) ? [] : '');
+            }
+            return;
+          }
           const row = payload.new;
           if (!row || !row.key || row.value === undefined) return;
           if (!_syncKeys.includes(row.key)) return;
